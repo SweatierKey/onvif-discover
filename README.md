@@ -3,6 +3,10 @@
 Discover ONVIF devices on the local network via WS-Discovery and print their
 device service URLs, one per line.
 
+## Demo
+
+[![asciicast](https://asciinema.org/a/w8BIP1wFwTkg23Rc.svg)](https://asciinema.org/a/w8BIP1wFwTkg23Rc)
+
 ## Install
 
     chmod +x onvif-discover
