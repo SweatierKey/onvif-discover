@@ -5,7 +5,9 @@ device service URLs, one per line.
 
 ## Demo
 
-[![asciicast](https://asciinema.org/a/w8BIP1wFwTkg23Rc.svg)](https://asciinema.org/a/w8BIP1wFwTkg23Rc)
+![demo](demo.gif)
+
+Watch with pause/seek on [asciinema.org](https://asciinema.org/a/w8BIP1wFwTkg23Rc).
 
 ## Install
 
