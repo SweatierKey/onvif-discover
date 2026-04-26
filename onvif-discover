@@ -1,0 +1,237 @@
+#!/usr/bin/env python3
+"""onvif-discover: discover ONVIF devices on the local network via WS-Discovery.
+
+Sends a multicast WS-Discovery Probe (UDP 3702 to 239.255.255.250) for the
+NetworkVideoTransmitter type, collects ProbeMatches responses for a fixed
+window, and prints one device service URL per line on stdout, sorted by IP.
+"""
+
+import argparse
+import os
+import socket
+import struct
+import sys
+import time
+import uuid
+import xml.etree.ElementTree as ET
+from typing import Iterable, List
+from urllib.parse import urlparse
+
+VERSION = "1.0.0"
+PROG = "onvif-discover"
+
+WS_DISCOVERY_GROUP = "239.255.255.250"
+WS_DISCOVERY_PORT = 3702
+
+NS = {
+    "s":  "http://www.w3.org/2003/05/soap-envelope",
+    "a":  "http://schemas.xmlsoap.org/ws/2004/08/addressing",
+    "d":  "http://schemas.xmlsoap.org/ws/2005/04/discovery",
+    "dn": "http://www.onvif.org/ver10/network/wsdl",
+}
+
+
+def log(verbose: bool, msg: str) -> None:
+    if verbose:
+        print(f"{PROG}: {msg}", file=sys.stderr)
+
+
+def err(msg: str) -> None:
+    print(f"{PROG}: {msg}", file=sys.stderr)
+
+
+def build_probe() -> bytes:
+    """Build a WS-Discovery Probe SOAP envelope for NetworkVideoTransmitter."""
+    message_id = f"uuid:{uuid.uuid4()}"
+    envelope = (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        '<e:Envelope'
+        ' xmlns:e="http://www.w3.org/2003/05/soap-envelope"'
+        ' xmlns:a="http://schemas.xmlsoap.org/ws/2004/08/addressing"'
+        ' xmlns:d="http://schemas.xmlsoap.org/ws/2005/04/discovery"'
+        ' xmlns:dn="http://www.onvif.org/ver10/network/wsdl">'
+        '<e:Header>'
+        f'<a:MessageID>{message_id}</a:MessageID>'
+        '<a:To e:mustUnderstand="true">urn:schemas-xmlsoap-org:ws:2005:04:discovery</a:To>'
+        '<a:Action e:mustUnderstand="true">'
+        'http://schemas.xmlsoap.org/ws/2005/04/discovery/Probe'
+        '</a:Action>'
+        '</e:Header>'
+        '<e:Body>'
+        '<d:Probe>'
+        '<d:Types>dn:NetworkVideoTransmitter</d:Types>'
+        '</d:Probe>'
+        '</e:Body>'
+        '</e:Envelope>'
+    )
+    return envelope.encode("utf-8")
+
+
+def parse_xaddrs(xml_bytes: bytes) -> List[str]:
+    """Return the list of XAddrs URLs from a ProbeMatches SOAP envelope.
+
+    Returns an empty list if the document does not contain ProbeMatches or
+    cannot be parsed. Each ProbeMatch may carry several space-separated XAddrs.
+    """
+    try:
+        root = ET.fromstring(xml_bytes)
+    except ET.ParseError:
+        return []
+
+    urls: List[str] = []
+    matches = root.findall(".//d:ProbeMatch", NS)
+    if not matches:
+        matches = root.findall(".//{*}ProbeMatch")
+    for m in matches:
+        xaddrs_el = m.find("d:XAddrs", NS)
+        if xaddrs_el is None:
+            xaddrs_el = m.find("{*}XAddrs")
+        if xaddrs_el is None or not xaddrs_el.text:
+            continue
+        for token in xaddrs_el.text.split():
+            token = token.strip()
+            if token:
+                urls.append(token)
+    return urls
+
+
+def _ip_sort_key(url: str):
+    """Sort key: numeric IPv4 octets when host is an IPv4, else fallback to
+    string. Port included as secondary key. Unparseable URLs sink to the end."""
+    try:
+        parsed = urlparse(url)
+    except ValueError:
+        return (1, url, 0)
+    host = parsed.hostname or ""
+    port = parsed.port or 0
+    parts = host.split(".")
+    if len(parts) == 4 and all(p.isdigit() and 0 <= int(p) <= 255 for p in parts):
+        return (0, tuple(int(p) for p in parts), port)
+    return (1, host, port)
+
+
+def sort_urls(urls: Iterable[str]) -> List[str]:
+    """Deduplicate and sort URLs by IPv4 address (numeric), then port."""
+    seen = set()
+    unique = []
+    for u in urls:
+        if u not in seen:
+            seen.add(u)
+            unique.append(u)
+    return sorted(unique, key=_ip_sort_key)
+
+
+def discover(timeout: float, bind_addr: str, verbose: bool) -> List[str]:
+    """Send a Probe and collect ProbeMatches XAddrs for `timeout` seconds.
+
+    Returns the deduplicated, sorted list of URLs. Network errors at the
+    socket level raise OSError to the caller.
+    """
+    probe = build_probe()
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 4)
+        try:
+            sock.setsockopt(
+                socket.IPPROTO_IP,
+                socket.IP_MULTICAST_IF,
+                socket.inet_aton(bind_addr if bind_addr != "0.0.0.0" else "0.0.0.0"),
+            )
+        except OSError:
+            pass
+        sock.bind((bind_addr, 0))
+        log(verbose, f"sending Probe to {WS_DISCOVERY_GROUP}:{WS_DISCOVERY_PORT}")
+        sock.sendto(probe, (WS_DISCOVERY_GROUP, WS_DISCOVERY_PORT))
+
+        deadline = time.monotonic() + timeout
+        urls: List[str] = []
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            sock.settimeout(remaining)
+            try:
+                data, addr = sock.recvfrom(65535)
+            except socket.timeout:
+                break
+            log(verbose, f"reply from {addr[0]}:{addr[1]} ({len(data)} bytes)")
+            for u in parse_xaddrs(data):
+                urls.append(u)
+        return sort_urls(urls)
+    finally:
+        sock.close()
+
+
+def write_output(urls: List[str], output_path: str) -> int:
+    """Write URLs (one per line) to stdout or to a file. Returns exit code."""
+    body = "".join(u + "\n" for u in urls)
+    if output_path == "-":
+        sys.stdout.write(body)
+        sys.stdout.flush()
+        return 0
+    try:
+        with open(output_path, "w", encoding="utf-8") as f:
+            f.write(body)
+    except OSError as e:
+        err(f"could not write {output_path}: {e.strerror or e}")
+        return 1
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog=PROG,
+        description="Discover ONVIF devices via WS-Discovery and print "
+                    "their device service URLs (one per line, sorted by IP).",
+        add_help=False,
+    )
+    p.add_argument("-t", "--timeout", type=float, default=3.0,
+                   help="seconds to wait for replies (default: 3.0)")
+    p.add_argument("-b", "--bind", default="0.0.0.0", metavar="ADDR",
+                   help="local IPv4 address to bind/probe from (default: 0.0.0.0)")
+    p.add_argument("-o", "--output", default="-", metavar="FILE",
+                   help="write URLs to FILE instead of stdout")
+    p.add_argument("-v", "--verbose", action="store_true",
+                   help="print progress and replies on stderr")
+    p.add_argument("-V", "--version", action="store_true",
+                   help="print version and exit")
+    p.add_argument("-h", "--help", action="store_true",
+                   help="show this help and exit")
+    return p
+
+
+def main(argv=None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+
+    if args.help:
+        parser.print_help()
+        return 0
+    if args.version:
+        print(f"{PROG} {VERSION}")
+        return 0
+
+    if args.timeout <= 0:
+        err("timeout must be > 0")
+        return 1
+
+    try:
+        urls = discover(args.timeout, args.bind, args.verbose)
+    except KeyboardInterrupt:
+        err("interrupted")
+        return 130
+    except OSError as e:
+        err(f"network error: {e.strerror or e}")
+        return 2
+
+    log(args.verbose, f"found {len(urls)} unique device(s)")
+    return write_output(urls, args.output)
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        err("interrupted")
+        sys.exit(130)
