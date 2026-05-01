@@ -140,6 +140,44 @@ class BuildProbeTests(unittest.TestCase):
         self.assertNotEqual(a, b)
 
 
+class DiscoverRetransmitTests(unittest.TestCase):
+    """Verify that discover() sends multiple probes within the timeout window.
+
+    We intercept sendto() via an in-process subclass so we don't depend on
+    actual multicast (which doesn't work in containers / WSL2)."""
+
+    def test_sends_default_three_probes(self):
+        import socket as _socket
+        sent = []
+        original_socket = _socket.socket
+
+        class FakeSock:
+            def __init__(self, *a, **kw):
+                self._real = original_socket(*a, **kw)
+            def setsockopt(self, *a, **kw): return self._real.setsockopt(*a, **kw)
+            def settimeout(self, t): return self._real.settimeout(t)
+            def bind(self, addr): return self._real.bind(addr)
+            def close(self): return self._real.close()
+            def sendto(self, data, addr):
+                sent.append(addr)
+                # don't actually send: silently discard
+                return len(data)
+            def recvfrom(self, n):
+                # Always block until the next settimeout fires.
+                raise TimeoutError()
+
+        _socket.socket = FakeSock
+        try:
+            urls = od.discover(timeout=1.6, bind_addr="127.0.0.1", verbose=False)
+        finally:
+            _socket.socket = original_socket
+        self.assertEqual(urls, [])
+        # 3 probes spaced by 0.5s should fit comfortably in 1.6s.
+        self.assertEqual(len(sent), od.DEFAULT_PROBE_RETRIES)
+        for addr in sent:
+            self.assertEqual(addr, (od.WS_DISCOVERY_GROUP, od.WS_DISCOVERY_PORT))
+
+
 class WriteOutputTests(unittest.TestCase):
     def test_writes_to_file(self):
         urls = ["http://1.1.1.1/x", "http://2.2.2.2/y"]

@@ -17,11 +17,18 @@ import xml.etree.ElementTree as ET
 from typing import Iterable, List
 from urllib.parse import urlparse
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 PROG = "onvif-discover"
 
 WS_DISCOVERY_GROUP = "239.255.255.250"
 WS_DISCOVERY_PORT = 3702
+
+# WS-Discovery clients SHOULD retransmit Probe messages — UDP multicast is
+# lossy on noisy LANs (especially WiFi), and some cheap camera firmwares
+# only respond to one of the first few probes. Three probes spaced by
+# small jittered intervals is the de-facto sweet spot.
+DEFAULT_PROBE_RETRIES = 3
+PROBE_INTERVAL = 0.5
 
 NS = {
     "s":  "http://www.w3.org/2003/05/soap-envelope",
@@ -121,43 +128,72 @@ def sort_urls(urls: Iterable[str]) -> List[str]:
     return sorted(unique, key=_ip_sort_key)
 
 
-def discover(timeout: float, bind_addr: str, verbose: bool) -> List[str]:
-    """Send a Probe and collect ProbeMatches XAddrs for `timeout` seconds.
+def discover(timeout: float, bind_addr: str, verbose: bool,
+             retries: int = DEFAULT_PROBE_RETRIES) -> List[str]:
+    """Send `retries` Probes (spaced by PROBE_INTERVAL) and collect
+    ProbeMatches XAddrs until `timeout` seconds have elapsed total.
+
+    Each probe carries a fresh MessageID (build_probe() generates a uuid),
+    so devices can dedupe by MessageID and we get one reply per device per
+    probe at most. We dedupe XAddrs at the end.
 
     Returns the deduplicated, sorted list of URLs. Network errors at the
     socket level raise OSError to the caller.
     """
-    probe = build_probe()
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
     try:
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 4)
-        try:
-            sock.setsockopt(
-                socket.IPPROTO_IP,
-                socket.IP_MULTICAST_IF,
-                socket.inet_aton(bind_addr if bind_addr != "0.0.0.0" else "0.0.0.0"),
-            )
-        except OSError:
-            pass
+        if bind_addr != "0.0.0.0":
+            try:
+                sock.setsockopt(
+                    socket.IPPROTO_IP,
+                    socket.IP_MULTICAST_IF,
+                    socket.inet_aton(bind_addr),
+                )
+            except OSError:
+                pass
         sock.bind((bind_addr, 0))
-        log(verbose, f"sending Probe to {WS_DISCOVERY_GROUP}:{WS_DISCOVERY_PORT}")
-        sock.sendto(probe, (WS_DISCOVERY_GROUP, WS_DISCOVERY_PORT))
 
-        deadline = time.monotonic() + timeout
+        start = time.monotonic()
+        deadline = start + timeout
+        next_probe_at = start
+        probes_left = max(1, retries)
+
         urls: List[str] = []
         while True:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
+            now = time.monotonic()
+            if now >= deadline:
                 break
+            if probes_left > 0 and now >= next_probe_at:
+                probe = build_probe()
+                log(verbose,
+                    f"sending Probe to {WS_DISCOVERY_GROUP}:{WS_DISCOVERY_PORT} "
+                    f"({DEFAULT_PROBE_RETRIES - probes_left + 1}/{DEFAULT_PROBE_RETRIES})")
+                try:
+                    sock.sendto(probe, (WS_DISCOVERY_GROUP, WS_DISCOVERY_PORT))
+                except OSError as e:
+                    # Re-raise on the first probe (means networking is broken),
+                    # tolerate on subsequent ones (transient EAGAIN etc.).
+                    if probes_left == retries:
+                        raise
+                    log(verbose, f"probe send failed: {e}")
+                probes_left -= 1
+                next_probe_at = now + PROBE_INTERVAL
+
+            # Wait for either the next-probe deadline or the overall deadline,
+            # whichever is sooner.
+            wait_until = deadline if probes_left == 0 else min(deadline, next_probe_at)
+            remaining = wait_until - time.monotonic()
+            if remaining <= 0:
+                continue
             sock.settimeout(remaining)
             try:
                 data, addr = sock.recvfrom(65535)
-            except socket.timeout:
-                break
+            except (socket.timeout, TimeoutError):
+                continue
             log(verbose, f"reply from {addr[0]}:{addr[1]} ({len(data)} bytes)")
-            for u in parse_xaddrs(data):
-                urls.append(u)
+            urls.extend(parse_xaddrs(data))
         return sort_urls(urls)
     finally:
         sock.close()
